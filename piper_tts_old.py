@@ -6,13 +6,16 @@ import tempfile
 import time
 import wave
 import shutil
+import gc
+import re
+from pathlib import Path
 
 # ================= CONFIG =================
 PIPER_BIN = "piper/piper"
 MODEL_PATH = "models/ngocngan3701.onnx"
 FINAL_WAV = "final_ngocngan.wav"
 
-TEXT = "Tóm tắt môi trường: Nhận xét về chất lượng không khí và môi trường làm việc: Hiện tại, môi trường làm việc của bạn khá ổn định với nhiệt độ 25.3°C, độ ẩm 49.3% và áp suất không khí là 1021.9 hPa. Tuy nhiên, chỉ số CO2 ở mức 448 ppm có thể cho thấy rằng không gian làm việc hơi ẩm ướt, có thể gây khó chịu cho người dùng trong thời gian dài. # Lời khuyên: Để cải thiện chất lượng không khí và tạo cảm giác thoải mái hơn, bạn có thể cân nhắc một số biện pháp như mở cửa sổ để thông thoáng không khí, hoặc sử dụng máy lọc không khí nếu không khí làm việc bị ẩm thấp. Ngoài ra, khuyến khích nhân viên thường xuyên đứng dậy đi lại, hít thở không khí bên ngoài để giảm thiểu tình trạng tăng CO2 trong phòng. "
+TEXT = "Tóm tắt môi trường: Nhận xét: Hiện tại, chất lượng không khí trong văn phòng khá ổn định với độ ẩm phù hợp (51.6%) và chỉ số CO2 ở mức chấp nhận được (487 ppm). Nhiệt độ cũng nằm trong khoảng thuận lợi cho sức khỏe (25.8°C). #Lời khuyên: Tuy nhiên, để duy trì không khí trong lành và nâng cao hiệu suất làm việc, bạn có thể tăng cường thông gió tự nhiên bằng cách mở cửa sổ vào những lúc không quá nóng hoặc lạnh. Ngoài ra, định kỳ kiểm tra và vệ sinh hệ thống lọc không khí cũng rất quan trọng. Hy vọng lời khuyên này sẽ hữu ích cho môi trường làm việc của bạn!"
 
 # ================= LOG =================
 logging.basicConfig(
@@ -100,21 +103,57 @@ def concat_wavs(wav_files, output_wav):
 
 
 def split_text(text, max_len=180):
-    sentences = []
-    buf = ""
-
-    for part in text.split(","):
-        if len(buf) + len(part) < max_len:
-            buf += part + ","
+    
+    """
+    Chia text thông minh theo câu ngắn
+    """
+    # Chuẩn hóa text
+    text = re.sub(r'\s+', ' ', text.strip())
+    text = text.replace('#', '.')  # Thay # thành dấu câu
+    
+    # Chia theo các dấu câu
+    parts = re.split(r'([.!?:,;])', text)
+    
+    chunks = []
+    current = ""
+    
+    i = 0
+    while i < len(parts):
+        segment = parts[i]
+        punct = parts[i + 1] if i + 1 < len(parts) else ""
+        
+        # Nếu segment quá dài, chia nhỏ hơn nữa
+        if len(segment) > max_len:
+            # Chia theo từ
+            words = segment.split()
+            temp = ""
+            for word in words:
+                if len(temp) + len(word) + 1 <= max_len:
+                    temp += word + " "
+                else:
+                    if temp:
+                        chunks.append(temp.strip())
+                    temp = word + " "
+            if temp:
+                current = temp
         else:
-            sentences.append(buf.strip(", "))
-            buf = part + ","
-
-    if buf:
-        sentences.append(buf.strip(", "))
-
-    return sentences
-
+            test = current + segment + punct
+            if len(test) <= max_len:
+                current = test + " "
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = segment + punct + " "
+        
+        i += 2
+    
+    if current.strip():
+        chunks.append(current.strip())
+    
+    # Lọc chunks rỗng và quá ngắn
+    chunks = [c.strip() for c in chunks if len(c.strip()) > 3]
+    
+    return chunks
 
 def main():
     log.info("=== START PIPER MULTI SUBPROCESS TEST ===")
