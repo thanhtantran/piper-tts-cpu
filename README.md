@@ -1,6 +1,6 @@
 # Piper TTS CPU (Python Script)
 
-README này hướng dẫn sử dụng `main.py` để chuyển văn bản tiếng Việt thành file âm thanh WAV bằng Piper.
+Ứng dụng này để chạy tự động chuyển văn bản tiếng Việt thành file âm thanh WAV qua Piper trên Orange Pi (ARM64)
 
 ## 1) Tổng quan
 
@@ -23,8 +23,8 @@ Script `main.py` thực hiện pipeline:
 ## 3) Yêu cầu
 
 - Python 3.8+
-- Có sẵn binary `piper` tương thích hệ điều hành/kiến trúc máy
-- Có model `.onnx` và file cấu hình `.onnx.json`
+- Có sẵn binary `piper` tương thích hệ điều hành/kiến trúc máy (ARM64)
+- Có model `.onnx` và file cấu hình `.onnx.json` (có sẵn 2 model là `ngocngan3701.onnx` và `deepman3909.onnx` sẵn trong rpo
 
 > Lưu ý: repo này đang đặt sẵn model và binary ở đường dẫn mặc định, nhưng bạn vẫn có thể override bằng tham số dòng lệnh.
 
