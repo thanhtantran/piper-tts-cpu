@@ -1,354 +1,148 @@
-import argparse
-import json
-import logging
-import os
-import queue
-import re
-import shutil
-import subprocess
-import sys
-import time
-import wave
-from datetime import datetime
-from pathlib import Path
-from threading import Lock, Thread
-
-from flask import Flask, jsonify, render_template, request, send_from_directory
-
-# ================= CONFIG =================
-PIPER_BIN = "piper/piper"
-OUTPUT_DIR = "output"
-LOG_FILE = "piper_subprocess.log"
-
-ENGLISH_PROPER_NOUNS = [
-    "Rockchip",
-    "Orange Pi",
-    "Raspberry Pi",
-    "Raspberry",
-    "Orange Pi OS",
-    "Ubuntu",
-    "Debian",
-    "Fedora",
-    "ARM",
-    "x86_64",
-    "Intel",
-    "AMD",
-    "NVIDIA",
-]
-
-# ================= SETUP =================
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")],
-)
-log = logging.getLogger("PIPER_WEB")
-
-app = Flask(__name__)
-
-# Queue state
-_task_queue = queue.Queue()
-current_task = None
-task_lock = Lock()
-
-
-def preserve_english_proper_nouns(text):
-    """Preserve English brand names so they are not converted incorrectly."""
-    replacements = {}
-    for index, name in enumerate(ENGLISH_PROPER_NOUNS):
-        token = f"__ENG_NAME_{index}__"
-        pattern = re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.IGNORECASE)
-        text = pattern.sub(token, text)
-        replacements[token] = name
-    return text, replacements
-
-
-def normalize_vietnamese_text(text):
-    """Normalize Vietnamese text for TTS while preserving English device names."""
-    text = re.sub(r"\s+", " ", str(text).strip())
-    text, replacements = preserve_english_proper_nouns(text)
-    text = text.replace("#", ".")
-    text = re.sub(r"(\d+)\.(\d+)%", r"\1,\2 phần trăm", text)
-    text = re.sub(r"(\d+)\.(\d+)°C", r"\1,\2 độ C", text)
-    text = re.sub(r"(\d+)\.(\d+)(?!\s*(phần trăm|độ C))", r"\1,\2", text)
-
-    for token, name in replacements.items():
-        text = text.replace(token, name)
-
-    return text
-
-
-def split_text_smart(text, max_len=150):
-    """Split text into sensible chunks by sentence and size."""
-    text = normalize_vietnamese_text(text)
-    sentences = re.split(r"([.!?:;])", text)
-
-    chunks = []
-    current = ""
-
-    i = 0
-    while i < len(sentences):
-        segment = sentences[i].strip()
-        punct = sentences[i + 1].strip() if i + 1 < len(sentences) else ""
-
-        if not segment:
-            i += 2
-            continue
-
-        if len(segment) > max_len:
-            sub_parts = re.split(r"([,;])", segment)
-            for j in range(0, len(sub_parts), 2):
-                sub_segment = sub_parts[j].strip()
-                sub_punct = sub_parts[j + 1].strip() if j + 1 < len(sub_parts) else ""
-
-                if len(sub_segment) > max_len:
-                    words = sub_segment.split()
-                    temp = ""
-                    for word in words:
-                        if len(temp + " " + word) <= max_len:
-                            temp += (" " + word) if temp else word
-                        else:
-                            if temp:
-                                chunks.append(temp.strip())
-                            temp = word
-                    if temp:
-                        current = temp + sub_punct + " "
-                else:
-                    test = current + sub_segment + sub_punct
-                    if len(test) <= max_len:
-                        current = test + " "
-                    else:
-                        if current.strip():
-                            chunks.append(current.strip())
-                        current = sub_segment + sub_punct + " "
-        else:
-            test = current + segment + punct
-            if len(test) <= max_len:
-                current = test + " "
-            else:
-                if current.strip():
-                    chunks.append(current.strip())
-                current = segment + punct + " "
-
-        i += 2
-
-    if current.strip():
-        chunks.append(current.strip())
-
-    return [c.strip() for c in chunks if len(c.strip()) > 3]
-
-
-def run_piper(text: str, out_wav: str, model_path: str):
-    """Run the Piper binary to synthesize a single chunk."""
-    cmd = [PIPER_BIN, "--model", model_path, "--output_file", out_wav]
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = proc.communicate(text, timeout=120)
-
-        if proc.returncode != 0:
-            log.error(f"Piper failed: {stderr}")
-            return False
-
-        if not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
-            log.error("WAV file not created or empty")
-            return False
-
-        return True
-    except Exception as exc:
-        log.error(f"Error running Piper: {exc}")
-        return False
-
-
-def concat_wavs(wav_files, output_wav):
-    """Concatenate WAV files."""
-    if not wav_files:
-        return False
-
-    try:
-        with wave.open(wav_files[0], "rb") as wf:
-            params = wf.getparams()
-
-        with wave.open(output_wav, "wb") as out_wf:
-            out_wf.setparams(params)
-            for wav_path in wav_files:
-                with wave.open(wav_path, "rb") as in_wf:
-                    frames = in_wf.readframes(in_wf.getnframes())
-                    out_wf.writeframes(frames)
-
-        return True
-    except Exception as exc:
-        log.error(f"Concatenation error: {exc}")
-        return False
-
-
-def get_models():
-    """Scan the models directory for .onnx files."""
-    models_dir = Path("models")
-    if not models_dir.exists():
-        return []
-    return [str(f.relative_to(models_dir)) for f in models_dir.glob("*.onnx")]
-
-
-def process_task(task_id, text, model_path):
-    """Process a TTS request sequentially."""
-    global current_task
-
-    with task_lock:
-        current_task = {
-            "id": task_id,
-            "status": "processing",
-            "progress": 0,
-            "total": 0,
-            "error": None,
-            "output": None,
-        }
-
-    log.info(f"Task {task_id} started")
-
-    chunks = split_text_smart(text)
-    total = len(chunks)
-
-    with task_lock:
-        current_task["total"] = total
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"tts_{timestamp}.wav"
-    output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-    temp_dir = os.path.join(OUTPUT_DIR, f"temp_{timestamp}")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    wav_files = []
-
-    try:
-        for i, chunk_text in enumerate(chunks):
-            log.info(f"Task {task_id} - chunk {i+1}/{total}")
-
-            wav_path = os.path.join(temp_dir, f"chunk_{i:03d}.wav")
-            success = run_piper(chunk_text, wav_path, model_path)
-
-            if not success:
-                with task_lock:
-                    current_task["status"] = "error"
-                    current_task["error"] = f"Failed at chunk {i+1}/{total}"
-                log.error(f"Task {task_id} failed at chunk {i+1}")
-                return
-
-            wav_files.append(wav_path)
-
-            with task_lock:
-                current_task["progress"] = i + 1
-
-            if i < total - 1:
-                time.sleep(0.2)
-
-        success = concat_wavs(wav_files, output_path)
-        if not success:
-            with task_lock:
-                current_task["status"] = "error"
-                current_task["error"] = "Failed to concatenate WAV files"
-            return
-
-        with task_lock:
-            current_task["status"] = "completed"
-            current_task["output"] = output_filename
-
-        log.info(f"Task {task_id} completed: {output_filename}")
-
-    except Exception as exc:
-        log.error(f"Task {task_id} error: {exc}")
-        with task_lock:
-            current_task["status"] = "error"
-            current_task["error"] = str(exc)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def worker():
-    """Background worker for the task queue."""
-    while True:
-        task_id, text, model_path = _task_queue.get()
-        process_task(task_id, text, model_path)
-        _task_queue.task_done()
-
-
-Thread(target=worker, daemon=True).start()
-
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/models")
-def api_models():
-    return jsonify(get_models())
-
-
-@app.route("/api/submit", methods=["POST"])
-def api_submit():
-    data = request.json or {}
-    text = str(data.get("text", "")).strip()
-    model = str(data.get("model", "")).strip()
-
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
-
-    if not model:
-        return jsonify({"error": "No model selected"}), 400
-
-    model_path = os.path.join("models", model)
-    if not os.path.exists(model_path):
-        return jsonify({"error": "Model not found"}), 400
-
-    task_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    _task_queue.put((task_id, text, model_path))
-
-    return jsonify({"task_id": task_id})
-
-
-@app.route("/api/status")
-def api_status():
-    with task_lock:
-        if current_task is None:
-            return jsonify({"status": "idle"})
-        return jsonify(current_task)
-
-
-@app.route("/api/log")
-def api_log():
-    """Return the last 100 lines of the log file."""
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            return jsonify({"lines": lines[-100:]})
-    except Exception:
-        return jsonify({"lines": []})
-
-
-@app.route("/output/<filename>")
-def download_file(filename):
-    return send_from_directory(OUTPUT_DIR, filename)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Piper TTS Flask web app")
-    parser.add_argument("--host", default=os.getenv("PIPER_HOST", "0.0.0.0"), help="Host to bind")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PIPER_PORT", "5000")), help="Port to bind")
-    parser.add_argument("--debug", action="store_true", help="Run Flask in debug mode")
-    args = parser.parse_args()
-
-    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True, use_reloader=False)
-
-
-if __name__ == "__main__":
-    main()
+# Piper TTS CPU
+
+Dự án này chuyển văn bản tiếng Việt thành file âm thanh WAV bằng Piper trên các thiết bị ARM như Rockchip, Orange Pi, Raspberry Pi, v.v.
+
+Có 2 cách chạy:
+- CLI: `main.py`
+- Flask web app: `app.py`
+
+Các tên riêng bằng tiếng Anh như Rockchip, Orange Pi, Raspberry Pi sẽ được giữ nguyên để Piper đọc đúng theo cách đọc tiếng Anh, không bị biến thành văn bản Việt Nam.
+
+## 1) Yêu cầu
+
+- Python 3.8+
+- Binary Piper tương thích với kiến trúc máy của bạn (ARM64, x86_64, ...)
+- Có ít nhất một file model `.onnx` trong thư mục `models/`
+
+Cài đặt thư viện Python:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 2) Chạy CLI
+
+Từ thư mục gốc project:
+
+```bash
+python3 main.py "Xin chào, đây là demo chuyển văn bản tiếng Việt thành giọng nói trên Orange Pi."
+```
+
+Ví dụ với tên riêng tiếng Anh:
+
+```bash
+python3 main.py "Rockchip và Orange Pi là các nền tảng ARM phổ biến. Raspberry Pi rất phổ biến cho học tập và prototype." -o demo.wav
+```
+
+Tùy chọn:
+
+```bash
+python3 main.py "Raspberry Pi và Rockchip là các board ARM phổ biến." \
+  -o output.wav \
+  -m models/ngocngan3701.onnx \
+  -b piper/piper \
+  --chunk-size 150
+```
+
+## 3) Chạy Flask web app
+
+Khởi động Flask app:
+
+```bash
+python3 app.py --host 0.0.0.0 --port 5000
+```
+
+Mở trình duyệt:
+
+```text
+http://<IP-cua-thiet-bi>:5000
+```
+
+Các endpoint:
+
+- `GET /api/models` — liệt kê model có sẵn
+- `POST /api/submit` — gửi văn bản để tạo âm thanh
+- `GET /api/status` — xem tiến độ công việc hiện tại
+- `GET /api/log` — xem log gần nhất
+- `GET /output/<filename>` — tải file WAV đã tạo
+
+Ví dụ gọi API:
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Orange Pi và Raspberry Pi là các board phát triển phổ biến.", "model": "ngocngan3701.onnx"}'
+```
+
+## 4) Cài đặt service để app chạy khi khởi động
+
+Tạo service:
+
+```bash
+sudo nano /etc/systemd/system/piper-tts-web.service
+```
+
+Nội dung:
+
+```ini
+[Unit]
+Description=Piper TTS Flask Web App
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/piper-tts-cpu
+ExecStart=/usr/bin/python3 /home/pi/piper-tts-cpu/app.py --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=3
+User=pi
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Nếu project của bạn nằm ở đường dẫn khác, thay `/home/pi/piper-tts-cpu` bằng đúng đường dẫn thực tế.
+
+Khởi động service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable piper-tts-web.service
+sudo systemctl start piper-tts-web.service
+sudo systemctl status piper-tts-web.service
+```
+
+Xem log service:
+
+```bash
+journalctl -u piper-tts-web.service -f
+```
+
+## 5) Xử lý lỗi nhanh
+
+### Piper binary not found
+
+```bash
+ls -l piper/piper
+chmod +x piper/piper
+```
+
+### Exec format error
+
+Binary Piper không đúng kiến trúc CPU. Dùng phiên bản tương thích với ARM64 hoặc x86_64 của máy bạn.
+
+### Không có file WAV đầu ra
+
+Kiểm tra log:
+
+```bash
+tail -f piper_subprocess.log
+```
+
+## 6) Ghi chú
+
+- `main.py` và `app.py` đều đã được cập nhật để giữ nguyên các tên thương hiệu tiếng Anh.
+- Nếu muốn thêm tên riêng khác, hãy bổ sung vào danh sách `ENGLISH_PROPER_NOUNS` ở cả 2 file.
