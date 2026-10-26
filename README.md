@@ -1,135 +1,354 @@
-# Piper TTS CPU (Python Script)
+import argparse
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import time
+import wave
+from datetime import datetime
+from pathlib import Path
+from threading import Lock, Thread
 
-Ứng dụng này để chạy tự động chuyển văn bản tiếng Việt thành file âm thanh WAV qua Piper trên Orange Pi (ARM64)
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
-## 1) Tổng quan
+# ================= CONFIG =================
+PIPER_BIN = "piper/piper"
+OUTPUT_DIR = "output"
+LOG_FILE = "piper_subprocess.log"
 
-Script `main.py` thực hiện pipeline:
+ENGLISH_PROPER_NOUNS = [
+    "Rockchip",
+    "Orange Pi",
+    "Raspberry Pi",
+    "Raspberry",
+    "Orange Pi OS",
+    "Ubuntu",
+    "Debian",
+    "Fedora",
+    "ARM",
+    "x86_64",
+    "Intel",
+    "AMD",
+    "NVIDIA",
+]
 
-1. Nhận text từ command line.
-2. Chuẩn hóa text tiếng Việt (khoảng trắng, dấu `#`, số thập phân, `%`, `°C`).
-3. Chia câu dài thành nhiều chunk nhỏ (`--chunk-size`, mặc định 150 ký tự).
-4. Gọi binary `piper` cho từng chunk.
-5. Nối các file WAV chunk thành 1 file WAV cuối.
-6. Ghi log ra console và file `piper_subprocess.log`.
+# ================= SETUP =================
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-## 2) Cấu trúc quan trọng
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")],
+)
+log = logging.getLogger("PIPER_WEB")
 
-- Script chính: `main.py`
-- Binary Piper mặc định: `piper/piper`
-- Model mặc định: `models/ngocngan3701.onnx`
-- Log file: `piper_subprocess.log`
+app = Flask(__name__)
 
-## 3) Yêu cầu
+# Queue state
+_task_queue = queue.Queue()
+current_task = None
+task_lock = Lock()
 
-- Python 3.8+
-- Có sẵn binary `piper` tương thích hệ điều hành/kiến trúc máy (ARM64)
-- Có model `.onnx` và file cấu hình `.onnx.json` (có sẵn 2 model là `ngocngan3701.onnx` và `deepman3909.onnx` sẵn trong rpo
 
-> Lưu ý: repo này đang đặt sẵn model và binary ở đường dẫn mặc định, nhưng bạn vẫn có thể override bằng tham số dòng lệnh.
+def preserve_english_proper_nouns(text):
+    """Preserve English brand names so they are not converted incorrectly."""
+    replacements = {}
+    for index, name in enumerate(ENGLISH_PROPER_NOUNS):
+        token = f"__ENG_NAME_{index}__"
+        pattern = re.compile(r"(?<!\w)" + re.escape(name) + r"(?!\w)", re.IGNORECASE)
+        text = pattern.sub(token, text)
+        replacements[token] = name
+    return text, replacements
 
-## 4) Cách chạy nhanh
 
-Từ thư mục gốc project:
+def normalize_vietnamese_text(text):
+    """Normalize Vietnamese text for TTS while preserving English device names."""
+    text = re.sub(r"\s+", " ", str(text).strip())
+    text, replacements = preserve_english_proper_nouns(text)
+    text = text.replace("#", ".")
+    text = re.sub(r"(\d+)\.(\d+)%", r"\1,\2 phần trăm", text)
+    text = re.sub(r"(\d+)\.(\d+)°C", r"\1,\2 độ C", text)
+    text = re.sub(r"(\d+)\.(\d+)(?!\s*(phần trăm|độ C))", r"\1,\2", text)
 
-```bash
-python3 main.py "Xin chào, đây là bản demo chuyển văn bản tiếng Việt thành giọng nói."
-```
+    for token, name in replacements.items():
+        text = text.replace(token, name)
 
-Nếu không truyền `-o`, script tự sinh tên file theo timestamp dạng `tts_YYYYMMDD_HHMMSS.wav`.
+    return text
 
-## 5) Cú pháp đầy đủ
 
-```bash
-python3 main.py "<noi_dung_van_ban>" \
-  -o output.wav \
-  -m models/ngocngan3701.onnx \
-  -b piper/piper \
-  --chunk-size 150
-```
+def split_text_smart(text, max_len=150):
+    """Split text into sensible chunks by sentence and size."""
+    text = normalize_vietnamese_text(text)
+    sentences = re.split(r"([.!?:;])", text)
 
-### Tham số
+    chunks = []
+    current = ""
 
-- `text` (bắt buộc): nội dung cần đọc.
-- `-o, --output`: tên file WAV đầu ra.
-- `-m, --model`: đường dẫn model `.onnx`.
-- `-b, --binary`: đường dẫn binary `piper`.
-- `--chunk-size`: độ dài tối đa mỗi chunk trước khi gọi Piper.
+    i = 0
+    while i < len(sentences):
+        segment = sentences[i].strip()
+        punct = sentences[i + 1].strip() if i + 1 < len(sentences) else ""
 
-## 6) Ví dụ thực tế
+        if not segment:
+            i += 2
+            continue
 
-### Ví dụ 1: Xuất file theo tên chỉ định
+        if len(segment) > max_len:
+            sub_parts = re.split(r"([,;])", segment)
+            for j in range(0, len(sub_parts), 2):
+                sub_segment = sub_parts[j].strip()
+                sub_punct = sub_parts[j + 1].strip() if j + 1 < len(sub_parts) else ""
 
-```bash
-python3 main.py "Nhiệt độ hiện tại là 25.8°C và độ ẩm 51.6%." -o weather.wav
-```
+                if len(sub_segment) > max_len:
+                    words = sub_segment.split()
+                    temp = ""
+                    for word in words:
+                        if len(temp + " " + word) <= max_len:
+                            temp += (" " + word) if temp else word
+                        else:
+                            if temp:
+                                chunks.append(temp.strip())
+                            temp = word
+                    if temp:
+                        current = temp + sub_punct + " "
+                else:
+                    test = current + sub_segment + sub_punct
+                    if len(test) <= max_len:
+                        current = test + " "
+                    else:
+                        if current.strip():
+                            chunks.append(current.strip())
+                        current = sub_segment + sub_punct + " "
+        else:
+            test = current + segment + punct
+            if len(test) <= max_len:
+                current = test + " "
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = segment + punct + " "
 
-Script sẽ chuẩn hóa text thành cách đọc thân thiện hơn (ví dụ `25,8 độ C`, `51,6 phần trăm`) trước khi tổng hợp giọng nói.
+        i += 2
 
-### Ví dụ 2: Đổi model khác
+    if current.strip():
+        chunks.append(current.strip())
 
-```bash
-python3 main.py "Xin chào bạn" \
-  -m models/deepman3909.onnx \
-  -o deepman.wav
-```
+    return [c.strip() for c in chunks if len(c.strip()) > 3]
 
-### Ví dụ 3: Chia chunk ngắn hơn
 
-```bash
-python3 main.py "<đoạn văn dài>" --chunk-size 100 -o long_text.wav
-```
+def run_piper(text: str, out_wav: str, model_path: str):
+    """Run the Piper binary to synthesize a single chunk."""
+    cmd = [PIPER_BIN, "--model", model_path, "--output_file", out_wav]
 
-## 7) Cách script xử lý text tiếng Việt
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = proc.communicate(text, timeout=120)
 
-Trong hàm `normalize_vietnamese_text`, script hiện xử lý:
+        if proc.returncode != 0:
+            log.error(f"Piper failed: {stderr}")
+            return False
 
-- Gộp nhiều khoảng trắng liên tiếp thành 1 khoảng trắng.
-- Đổi `#` thành `.` để ngắt câu tự nhiên.
-- Đổi số thập phân `%`: `51.6%` -> `51,6 phần trăm`.
-- Đổi số thập phân `°C`: `25.8°C` -> `25,8 độ C`.
-- Đổi số thập phân khác từ `.` sang `,` để đọc đúng kiểu tiếng Việt.
+        if not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
+            log.error("WAV file not created or empty")
+            return False
 
-## 8) Cách script chia chunk
+        return True
+    except Exception as exc:
+        log.error(f"Error running Piper: {exc}")
+        return False
 
-Hàm `split_text_smart` chia văn bản theo thứ tự ưu tiên:
 
-1. Dấu câu chính: `. ! ? : ;`
-2. Nếu vẫn quá dài, chia tiếp theo `, ;`
-3. Nếu vẫn quá dài, tách theo từ
+def concat_wavs(wav_files, output_wav):
+    """Concatenate WAV files."""
+    if not wav_files:
+        return False
 
-Mục tiêu là giảm lỗi khi đưa một câu quá dài vào Piper.
+    try:
+        with wave.open(wav_files[0], "rb") as wf:
+            params = wf.getparams()
 
-## 9) Log và xử lý lỗi
+        with wave.open(output_wav, "wb") as out_wf:
+            out_wf.setparams(params)
+            for wav_path in wav_files:
+                with wave.open(wav_path, "rb") as in_wf:
+                    frames = in_wf.readframes(in_wf.getnframes())
+                    out_wf.writeframes(frames)
 
-- Console hiển thị tiến trình từng chunk.
-- File `piper_subprocess.log` lưu toàn bộ log.
-- Các lỗi phổ biến:
-  - Sai đường dẫn `--binary` hoặc `--model`
-  - Binary không có quyền chạy (`chmod +x`)
-  - Binary không đúng kiến trúc (vd: ARM binary chạy trên x86_64 sẽ báo `Exec format error`)
+        return True
+    except Exception as exc:
+        log.error(f"Concatenation error: {exc}")
+        return False
 
-## 10) Troubleshooting nhanh
 
-### Lỗi `Piper binary not found`
+def get_models():
+    """Scan the models directory for .onnx files."""
+    models_dir = Path("models")
+    if not models_dir.exists():
+        return []
+    return [str(f.relative_to(models_dir)) for f in models_dir.glob("*.onnx")]
 
-Kiểm tra đúng path và quyền truy cập:
 
-```bash
-ls -l piper/piper
-```
+def process_task(task_id, text, model_path):
+    """Process a TTS request sequentially."""
+    global current_task
 
-### Lỗi `Exec format error`
+    with task_lock:
+        current_task = {
+            "id": task_id,
+            "status": "processing",
+            "progress": 0,
+            "total": 0,
+            "error": None,
+            "output": None,
+        }
 
-Binary không tương thích kiến trúc CPU hiện tại. Hãy dùng bản Piper đúng kiến trúc máy của bạn.
+    log.info(f"Task {task_id} started")
 
-### Không có file WAV đầu ra
+    chunks = split_text_smart(text)
+    total = len(chunks)
 
-Mở `piper_subprocess.log` để xem chunk nào bị fail và stderr chi tiết từ Piper.
+    with task_lock:
+        current_task["total"] = total
 
-## 11) Gợi ý cải tiến (nếu bạn muốn mở rộng)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"tts_{timestamp}.wav"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
 
-- Thêm chế độ đọc text từ file (`--input-file`).
-- Thêm đầu ra MP3 (qua ffmpeg).
-- Chạy song song chunk để tăng tốc (cần kiểm soát RAM/CPU).
-- Thêm bộ quy tắc chuẩn hóa cho ngày tháng, tiền tệ, URL, viết tắt.
+    temp_dir = os.path.join(OUTPUT_DIR, f"temp_{timestamp}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    wav_files = []
+
+    try:
+        for i, chunk_text in enumerate(chunks):
+            log.info(f"Task {task_id} - chunk {i+1}/{total}")
+
+            wav_path = os.path.join(temp_dir, f"chunk_{i:03d}.wav")
+            success = run_piper(chunk_text, wav_path, model_path)
+
+            if not success:
+                with task_lock:
+                    current_task["status"] = "error"
+                    current_task["error"] = f"Failed at chunk {i+1}/{total}"
+                log.error(f"Task {task_id} failed at chunk {i+1}")
+                return
+
+            wav_files.append(wav_path)
+
+            with task_lock:
+                current_task["progress"] = i + 1
+
+            if i < total - 1:
+                time.sleep(0.2)
+
+        success = concat_wavs(wav_files, output_path)
+        if not success:
+            with task_lock:
+                current_task["status"] = "error"
+                current_task["error"] = "Failed to concatenate WAV files"
+            return
+
+        with task_lock:
+            current_task["status"] = "completed"
+            current_task["output"] = output_filename
+
+        log.info(f"Task {task_id} completed: {output_filename}")
+
+    except Exception as exc:
+        log.error(f"Task {task_id} error: {exc}")
+        with task_lock:
+            current_task["status"] = "error"
+            current_task["error"] = str(exc)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def worker():
+    """Background worker for the task queue."""
+    while True:
+        task_id, text, model_path = _task_queue.get()
+        process_task(task_id, text, model_path)
+        _task_queue.task_done()
+
+
+Thread(target=worker, daemon=True).start()
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/models")
+def api_models():
+    return jsonify(get_models())
+
+
+@app.route("/api/submit", methods=["POST"])
+def api_submit():
+    data = request.json or {}
+    text = str(data.get("text", "")).strip()
+    model = str(data.get("model", "")).strip()
+
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    if not model:
+        return jsonify({"error": "No model selected"}), 400
+
+    model_path = os.path.join("models", model)
+    if not os.path.exists(model_path):
+        return jsonify({"error": "Model not found"}), 400
+
+    task_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    _task_queue.put((task_id, text, model_path))
+
+    return jsonify({"task_id": task_id})
+
+
+@app.route("/api/status")
+def api_status():
+    with task_lock:
+        if current_task is None:
+            return jsonify({"status": "idle"})
+        return jsonify(current_task)
+
+
+@app.route("/api/log")
+def api_log():
+    """Return the last 100 lines of the log file."""
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            return jsonify({"lines": lines[-100:]})
+    except Exception:
+        return jsonify({"lines": []})
+
+
+@app.route("/output/<filename>")
+def download_file(filename):
+    return send_from_directory(OUTPUT_DIR, filename)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Piper TTS Flask web app")
+    parser.add_argument("--host", default=os.getenv("PIPER_HOST", "0.0.0.0"), help="Host to bind")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PIPER_PORT", "5000")), help="Port to bind")
+    parser.add_argument("--debug", action="store_true", help="Run Flask in debug mode")
+    args = parser.parse_args()
+
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True, use_reloader=False)
+
+
+if __name__ == "__main__":
+    main()

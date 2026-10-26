@@ -1,0 +1,204 @@
+# Piper TTS CPU
+
+This project converts Vietnamese text into WAV audio using the Piper TTS engine on CPU-based devices such as Rockchip, Orange Pi, Raspberry Pi, and similar ARM single-board computers.
+
+The project includes two modes:
+
+- CLI mode: `main.py`
+- Flask web app mode: `app.py`
+
+The text normalizer keeps English brand names such as Rockchip, Orange Pi, and Raspberry Pi in their original English form so they are read correctly in English instead of being mis-pronounced in Vietnamese.
+
+## Features
+
+- Convert long Vietnamese text into WAV output
+- Automatically split text into smaller chunks before synthesis
+- Support multiple Piper model files
+- Web UI to submit TTS jobs and view progress
+- Works on ARM64 boards and low-power single-board computers
+
+## Repository layout
+
+- `main.py` — command-line TTS entry point
+- `app.py` — Flask web app for browser-based usage
+- `models/` — Piper model files (`.onnx`)
+- `piper/` — Piper binary
+- `templates/` — Flask HTML UI
+- `output/` — generated WAV files
+- `piper_subprocess.log` — log output
+
+## Requirements
+
+- Python 3.8+
+- Piper binary compatible with your platform (ARM64, x86_64, etc.)
+- At least one model file under `models/`
+
+Install Python dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 1) Run the CLI version
+
+From the project root:
+
+```bash
+python3 main.py "Xin chào, đây là demo chuyển văn bản tiếng Việt thành giọng nói trên Orange Pi."
+```
+
+Optional parameters:
+
+```bash
+python3 main.py "Raspberry Pi and Rockchip are popular ARM boards." \
+  -o output.wav \
+  -m models/ngocngan3701.onnx \
+  -b piper/piper \
+  --chunk-size 150
+```
+
+This command reads English brand names in English as expected.
+
+## 2) Run the Flask web app
+
+Start the web app from the project root:
+
+```bash
+python3 app.py --host 0.0.0.0 --port 5000
+```
+
+Then open the browser at:
+
+```text
+http://<your-device-ip>:5000
+```
+
+The app exposes an API as well:
+
+- `GET /api/models` — list available models
+- `POST /api/submit` — submit text for synthesis
+- `GET /api/status` — check current task status
+- `GET /api/log` — view recent logs
+- `GET /output/<filename>` — download generated WAV audio
+
+Example API call:
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Orange Pi and Raspberry Pi are popular development boards.", "model": "ngocngan3701.onnx"}'
+```
+
+## 3) Run the Flask app automatically at boot with systemd
+
+Create a service file:
+
+```bash
+sudo nano /etc/systemd/system/piper-tts-web.service
+```
+
+Paste the following:
+
+```ini
+[Unit]
+Description=Piper TTS Flask Web App
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/piper-tts-cpu
+ExecStart=/usr/bin/python3 /home/pi/piper-tts-cpu/app.py --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=3
+User=pi
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If your project is under a different directory, replace `/home/pi/piper-tts-cpu` with your real path.
+
+Then enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable piper-tts-web.service
+sudo systemctl start piper-tts-web.service
+sudo systemctl status piper-tts-web.service
+```
+
+Check that the service is running:
+
+```bash
+journalctl -u piper-tts-web.service -f
+```
+
+## 4) Troubleshooting
+
+### Piper binary not found
+
+Check that the binary exists and is executable:
+
+```bash
+ls -l piper/piper
+chmod +x piper/piper
+```
+
+### Exec format error
+
+This usually means the binary is built for a different CPU architecture.
+Use a version compatible with your board (for example ARM64 for Orange Pi / Raspberry Pi 64-bit OS).
+
+### `app.py` won't start
+
+Check the Python environment and the path to the `models` directory:
+
+```bash
+python3 --version
+ls -l models
+```
+
+## 5) Example usage with English device names
+
+The project is designed to handle names like these naturally in English:
+
+- Rockchip
+- Orange Pi
+- Raspberry Pi
+- Orange Pi OS
+- Ubuntu
+- Debian
+
+Example input:
+
+```bash
+python3 main.py "Rockchip and Orange Pi are common ARM platforms. Raspberry Pi is widely used in education and prototyping."
+```
+
+The brand names remain in English and are not transformed into a Vietnamese reading pattern.
+
+## 6) Notes
+
+- For best results, keep the default voice model for Vietnamese speech.
+- For English names, the normalization logic preserves the original text to avoid unnatural pronunciation.
+- If you want to add support for more device names or product brands, update the `ENGLISH_PROPER_NOUNS` list in both `main.py` and `app.py`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
