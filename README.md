@@ -1,135 +1,148 @@
-# Piper TTS CPU (Python Script)
+# Piper TTS CPU
 
-Ứng dụng này để chạy tự động chuyển văn bản tiếng Việt thành file âm thanh WAV qua Piper trên Orange Pi (ARM64)
+Dự án này chuyển văn bản tiếng Việt thành file âm thanh WAV bằng Piper trên các thiết bị ARM như Rockchip, Orange Pi, Raspberry Pi, v.v.
 
-## 1) Tổng quan
+Có 2 cách chạy:
+- CLI: `main.py`
+- Flask web app: `app.py`
 
-Script `main.py` thực hiện pipeline:
+Các tên riêng bằng tiếng Anh như Rockchip, Orange Pi, Raspberry Pi sẽ được giữ nguyên để Piper đọc đúng theo cách đọc tiếng Anh, không bị biến thành văn bản Việt Nam.
 
-1. Nhận text từ command line.
-2. Chuẩn hóa text tiếng Việt (khoảng trắng, dấu `#`, số thập phân, `%`, `°C`).
-3. Chia câu dài thành nhiều chunk nhỏ (`--chunk-size`, mặc định 150 ký tự).
-4. Gọi binary `piper` cho từng chunk.
-5. Nối các file WAV chunk thành 1 file WAV cuối.
-6. Ghi log ra console và file `piper_subprocess.log`.
-
-## 2) Cấu trúc quan trọng
-
-- Script chính: `main.py`
-- Binary Piper mặc định: `piper/piper`
-- Model mặc định: `models/ngocngan3701.onnx`
-- Log file: `piper_subprocess.log`
-
-## 3) Yêu cầu
+## 1) Yêu cầu
 
 - Python 3.8+
-- Có sẵn binary `piper` tương thích hệ điều hành/kiến trúc máy (ARM64)
-- Có model `.onnx` và file cấu hình `.onnx.json` (có sẵn 2 model là `ngocngan3701.onnx` và `deepman3909.onnx` sẵn trong rpo
+- Binary Piper tương thích với kiến trúc máy của bạn (ARM64, x86_64, ...)
+- Có ít nhất một file model `.onnx` trong thư mục `models/`
 
-> Lưu ý: repo này đang đặt sẵn model và binary ở đường dẫn mặc định, nhưng bạn vẫn có thể override bằng tham số dòng lệnh.
+Cài đặt thư viện Python:
 
-## 4) Cách chạy nhanh
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 2) Chạy CLI
 
 Từ thư mục gốc project:
 
 ```bash
-python3 main.py "Xin chào, đây là bản demo chuyển văn bản tiếng Việt thành giọng nói."
+python3 main.py "Xin chào, đây là demo chuyển văn bản tiếng Việt thành giọng nói trên Orange Pi."
 ```
 
-Nếu không truyền `-o`, script tự sinh tên file theo timestamp dạng `tts_YYYYMMDD_HHMMSS.wav`.
-
-## 5) Cú pháp đầy đủ
+Ví dụ với tên riêng tiếng Anh:
 
 ```bash
-python3 main.py "<noi_dung_van_ban>" \
+python3 main.py "Rockchip và Orange Pi là các nền tảng ARM phổ biến. Raspberry Pi rất phổ biến cho học tập và prototype." -o demo.wav
+```
+
+Tùy chọn:
+
+```bash
+python3 main.py "Raspberry Pi và Rockchip là các board ARM phổ biến." \
   -o output.wav \
   -m models/ngocngan3701.onnx \
   -b piper/piper \
   --chunk-size 150
 ```
 
-### Tham số
+## 3) Chạy Flask web app
 
-- `text` (bắt buộc): nội dung cần đọc.
-- `-o, --output`: tên file WAV đầu ra.
-- `-m, --model`: đường dẫn model `.onnx`.
-- `-b, --binary`: đường dẫn binary `piper`.
-- `--chunk-size`: độ dài tối đa mỗi chunk trước khi gọi Piper.
-
-## 6) Ví dụ thực tế
-
-### Ví dụ 1: Xuất file theo tên chỉ định
+Khởi động Flask app:
 
 ```bash
-python3 main.py "Nhiệt độ hiện tại là 25.8°C và độ ẩm 51.6%." -o weather.wav
+python3 app.py --host 0.0.0.0 --port 5000
 ```
 
-Script sẽ chuẩn hóa text thành cách đọc thân thiện hơn (ví dụ `25,8 độ C`, `51,6 phần trăm`) trước khi tổng hợp giọng nói.
+Mở trình duyệt:
 
-### Ví dụ 2: Đổi model khác
+```text
+http://<IP-cua-thiet-bi>:5000
+```
+
+Các endpoint:
+
+- `GET /api/models` — liệt kê model có sẵn
+- `POST /api/submit` — gửi văn bản để tạo âm thanh
+- `GET /api/status` — xem tiến độ công việc hiện tại
+- `GET /api/log` — xem log gần nhất
+- `GET /output/<filename>` — tải file WAV đã tạo
+
+Ví dụ gọi API:
 
 ```bash
-python3 main.py "Xin chào bạn" \
-  -m models/deepman3909.onnx \
-  -o deepman.wav
+curl -X POST http://127.0.0.1:5000/api/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Orange Pi và Raspberry Pi là các board phát triển phổ biến.", "model": "ngocngan3701.onnx"}'
 ```
 
-### Ví dụ 3: Chia chunk ngắn hơn
+## 4) Cài đặt service để app chạy khi khởi động
+
+Tạo service:
 
 ```bash
-python3 main.py "<đoạn văn dài>" --chunk-size 100 -o long_text.wav
+sudo nano /etc/systemd/system/piper-tts-web.service
 ```
 
-## 7) Cách script xử lý text tiếng Việt
+Nội dung:
 
-Trong hàm `normalize_vietnamese_text`, script hiện xử lý:
+```ini
+[Unit]
+Description=Piper TTS Flask Web App
+After=network.target
 
-- Gộp nhiều khoảng trắng liên tiếp thành 1 khoảng trắng.
-- Đổi `#` thành `.` để ngắt câu tự nhiên.
-- Đổi số thập phân `%`: `51.6%` -> `51,6 phần trăm`.
-- Đổi số thập phân `°C`: `25.8°C` -> `25,8 độ C`.
-- Đổi số thập phân khác từ `.` sang `,` để đọc đúng kiểu tiếng Việt.
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/piper-tts-cpu
+ExecStart=/usr/bin/python3 /home/pi/piper-tts-cpu/app.py --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=3
+User=pi
+Environment=PYTHONUNBUFFERED=1
 
-## 8) Cách script chia chunk
+[Install]
+WantedBy=multi-user.target
+```
 
-Hàm `split_text_smart` chia văn bản theo thứ tự ưu tiên:
+Nếu project của bạn nằm ở đường dẫn khác, thay `/home/pi/piper-tts-cpu` bằng đúng đường dẫn thực tế.
 
-1. Dấu câu chính: `. ! ? : ;`
-2. Nếu vẫn quá dài, chia tiếp theo `, ;`
-3. Nếu vẫn quá dài, tách theo từ
+Khởi động service:
 
-Mục tiêu là giảm lỗi khi đưa một câu quá dài vào Piper.
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable piper-tts-web.service
+sudo systemctl start piper-tts-web.service
+sudo systemctl status piper-tts-web.service
+```
 
-## 9) Log và xử lý lỗi
+Xem log service:
 
-- Console hiển thị tiến trình từng chunk.
-- File `piper_subprocess.log` lưu toàn bộ log.
-- Các lỗi phổ biến:
-  - Sai đường dẫn `--binary` hoặc `--model`
-  - Binary không có quyền chạy (`chmod +x`)
-  - Binary không đúng kiến trúc (vd: ARM binary chạy trên x86_64 sẽ báo `Exec format error`)
+```bash
+journalctl -u piper-tts-web.service -f
+```
 
-## 10) Troubleshooting nhanh
+## 5) Xử lý lỗi nhanh
 
-### Lỗi `Piper binary not found`
-
-Kiểm tra đúng path và quyền truy cập:
+### Piper binary not found
 
 ```bash
 ls -l piper/piper
+chmod +x piper/piper
 ```
 
-### Lỗi `Exec format error`
+### Exec format error
 
-Binary không tương thích kiến trúc CPU hiện tại. Hãy dùng bản Piper đúng kiến trúc máy của bạn.
+Binary Piper không đúng kiến trúc CPU. Dùng phiên bản tương thích với ARM64 hoặc x86_64 của máy bạn.
 
 ### Không có file WAV đầu ra
 
-Mở `piper_subprocess.log` để xem chunk nào bị fail và stderr chi tiết từ Piper.
+Kiểm tra log:
 
-## 11) Gợi ý cải tiến (nếu bạn muốn mở rộng)
+```bash
+tail -f piper_subprocess.log
+```
 
-- Thêm chế độ đọc text từ file (`--input-file`).
-- Thêm đầu ra MP3 (qua ffmpeg).
-- Chạy song song chunk để tăng tốc (cần kiểm soát RAM/CPU).
-- Thêm bộ quy tắc chuẩn hóa cho ngày tháng, tiền tệ, URL, viết tắt.
+## 6) Ghi chú
+
+- `main.py` và `app.py` đều đã được cập nhật để giữ nguyên các tên thương hiệu tiếng Anh.
+- Nếu muốn thêm tên riêng khác, hãy bổ sung vào danh sách `ENGLISH_PROPER_NOUNS` ở cả 2 file.
