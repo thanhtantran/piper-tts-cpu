@@ -3,33 +3,44 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Piper TTS Web</title>
+    <title>Local Piper TTS</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: system-ui, -apple-system, sans-serif; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        h1 { margin-bottom: 20px; color: #333; }
-        label { display: block; margin-top: 15px; margin-bottom: 5px; font-weight: 600; color: #555; }
-        select, textarea, button { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        body { font-family: system-ui, -apple-system, sans-serif; padding: 20px; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
+        .container { max-width: 900px; margin: 0 auto; background: #161b22; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+        .header { text-align: center; margin-bottom: 40px; }
+        h1 { font-size: 32px; margin-bottom: 8px; color: #58a6ff; font-weight: 700; }
+        .tagline { color: #8b949e; font-size: 16px; margin-bottom: 30px; }
+        label { display: block; margin-top: 20px; margin-bottom: 8px; font-weight: 600; color: #c9d1d9; }
+        select, textarea, button { width: 100%; padding: 12px; border: 1px solid #30363d; border-radius: 6px; font-size: 14px; background: #0d1117; color: #c9d1d9; }
+        select:focus, textarea:focus { outline: none; border-color: #58a6ff; }
         textarea { min-height: 150px; font-family: inherit; resize: vertical; }
-        button { background: #007bff; color: white; border: none; cursor: pointer; margin-top: 15px; font-weight: 600; }
-        button:hover { background: #0056b3; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
-        .status { margin-top: 20px; padding: 15px; border-radius: 4px; display: none; }
-        .status.processing { display: block; background: #fff3cd; border: 1px solid #ffc107; }
-        .status.completed { display: block; background: #d4edda; border: 1px solid #28a745; }
-        .status.error { display: block; background: #f8d7da; border: 1px solid #dc3545; }
-        .progress { margin-top: 10px; font-weight: 600; }
+        button { background: linear-gradient(180deg, #238636 0%, #2ea043 100%); color: white; border: none; cursor: pointer; margin-top: 20px; font-weight: 600; transition: 0.2s; }
+        button:hover { background: linear-gradient(180deg, #2ea043 0%, #238636 100%); }
+        button:disabled { background: #30363d; cursor: not-allowed; opacity: 0.6; }
+        .status { margin-top: 25px; padding: 16px; border-radius: 6px; display: none; border: 1px solid; }
+        .status.processing { display: block; background: rgba(187, 128, 9, 0.1); border-color: #bb8009; }
+        .status.completed { display: block; background: rgba(46, 160, 67, 0.1); border-color: #2ea043; }
+        .status.error { display: block; background: rgba(248, 81, 73, 0.1); border-color: #f85149; }
+        .progress { font-weight: 600; color: #c9d1d9; }
         .output { margin-top: 15px; }
-        .output a { display: inline-block; margin-right: 10px; padding: 8px 15px; background: #28a745; color: white; text-decoration: none; border-radius: 4px; }
-        .output a:hover { background: #218838; }
-        .log-section { margin-top: 30px; }
-        .log-box { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; max-height: 300px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; }
+        .output a { display: inline-block; margin-right: 10px; padding: 10px 16px; background: #238636; color: white; text-decoration: none; border-radius: 6px; font-weight: 500; transition: 0.2s; }
+        .output a:hover { background: #2ea043; }
+        .log-section { margin-top: 35px; }
+        .log-box { background: #0d1117; color: #8b949e; padding: 16px; border-radius: 6px; max-height: 300px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 12px; white-space: pre-wrap; border: 1px solid #30363d; }
+        .tcf-footer { text-align: center; margin-top: 40px; padding-top: 30px; border-top: 1px solid #30363d; color: #8b949e; font-size: 14px; }
+        .tcf-footer a { color: #58a6ff; text-decoration: none; }
+        .tcf-footer a:hover { text-decoration: underline; }
+        .heart { width: 16px; height: 16px; color: #f85149; vertical-align: middle; margin: 0 4px; animation: heartbeat 1.5s ease-in-out infinite; }
+        @keyframes heartbeat { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Piper TTS - Vietnamese Text to Speech</h1>
+        <div class="header">
+            <h1>Local Piper TTS</h1>
+            <div class="tagline">Chuyển đổi văn bản thành giọng nói tiếng Việt hoàn toàn local</div>
+        </div>
         
         <label for="model">Chọn Model:</label>
         <select id="model">
@@ -50,6 +61,8 @@
             <label>Piper Log (tự động cập nhật):</label>
             <div id="log" class="log-box">Chưa có log...</div>
         </div>
+        
+        <p class="tcf-footer">Copyright 2026 © · Được tạo ra cùng với <svg class="heart" viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 10.54L12 20.35z"/></svg> bởi <strong style="font-weight:500;color:#58a6ff"><a href="https://tonytran.id.vn" target="_blank">Tony Trần</a></strong></p>
     </div>
 
     <script>
